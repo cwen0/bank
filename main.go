@@ -26,6 +26,7 @@ var (
 	longTxn     = flag.Bool("long-txn", true, "enable long-term transactions")
 	pessimistic = flag.Bool("pessimistic", false, "use pessimistic transaction")
 	dbAddr      = flag.String("addr", "", "the address of db")
+	longConn    = flag.Bool("long-conn", false, "use long connection mode (each goroutine maintains its own connection)")
 )
 
 var (
@@ -43,7 +44,7 @@ func main() {
 
 	dbDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s", *user, *pw, *dbAddr, *dbName)
 	log.Info(dbDSN)
-	db, err := OpenDB(dbDSN, 1)
+	db, err := OpenDB(dbDSN, 1, *longConn)
 	if err != nil {
 		log.Fatalf("[bank] create dlog error %v", err)
 	}
@@ -69,12 +70,12 @@ func main() {
 
 	err = db.Close()
 	if err != nil {
-		log.Fatalf("[bank] fail to close set txmode conn", err)
+		log.Fatalf("[bank] fail to close set txmode conn: %v", err)
 	}
 
 	time.Sleep(5 * time.Second)
 
-	db, err = OpenDB(dbDSN, *concurrency)
+	db, err = OpenDB(dbDSN, *concurrency, *longConn)
 	if err != nil {
 		log.Fatalf("[bank] create dlog error %v", err)
 	}
@@ -89,6 +90,11 @@ func main() {
 		sig := <-sc
 		log.Infof("[bank] Got signal [%s] to exist.", sig)
 		cancel()
+		// Close database connection before exit
+		// Note: db is captured from outer scope, so it's safe to access
+		if db != nil {
+			db.Close()
+		}
 		os.Exit(0)
 	}()
 
@@ -98,6 +104,8 @@ func main() {
 		TableNum:      *tables,
 		Concurrency:   *concurrency,
 		EnableLongTxn: *longTxn,
+		UseLongConn:   *longConn,
+		RetryLimit:    *retryLimit,
 	}
 	bank := NewBankCase(&cfg)
 	if err := bank.Initialize(ctx, db); err != nil {

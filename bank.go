@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,12 +15,73 @@ import (
 	"golang.org/x/net/context"
 )
 
+// dbConn represents either a shared *sql.DB or a dedicated *sql.Conn for long connection mode
+type dbConn interface {
+	Begin() (*sql.Tx, error)
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}
+
+// dbWrapper wraps *sql.DB to implement dbConn interface
+type dbWrapper struct {
+	db *sql.DB
+}
+
+func (w *dbWrapper) Begin() (*sql.Tx, error) {
+	return w.db.Begin()
+}
+
+func (w *dbWrapper) Exec(query string, args ...interface{}) (sql.Result, error) {
+	return w.db.Exec(query, args...)
+}
+
+func (w *dbWrapper) QueryRow(query string, args ...interface{}) *sql.Row {
+	return w.db.QueryRow(query, args...)
+}
+
+func (w *dbWrapper) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	return w.db.Query(query, args...)
+}
+
+// connWrapper wraps *sql.Conn to implement dbConn interface
+type connWrapper struct {
+	conn *sql.Conn
+	ctx  context.Context
+}
+
+// newConnWrapper creates a new connWrapper with the given connection and context
+func newConnWrapper(conn *sql.Conn, ctx context.Context) *connWrapper {
+	return &connWrapper{
+		conn: conn,
+		ctx:  ctx,
+	}
+}
+
+func (w *connWrapper) Begin() (*sql.Tx, error) {
+	return w.conn.BeginTx(w.ctx, nil)
+}
+
+func (w *connWrapper) Exec(query string, args ...interface{}) (sql.Result, error) {
+	return w.conn.ExecContext(w.ctx, query, args...)
+}
+
+func (w *connWrapper) QueryRow(query string, args ...interface{}) *sql.Row {
+	return w.conn.QueryRowContext(w.ctx, query, args...)
+}
+
+func (w *connWrapper) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	return w.conn.QueryContext(w.ctx, query, args...)
+}
+
 // BankCase is for concurrent balance transfer.
 type BankCase struct {
 	mu      sync.RWMutex
 	cfg     *Config
 	wg      sync.WaitGroup
 	stopped int32
+	// Cache for table index strings to avoid repeated fmt.Sprintf
+	indexCache []string
 }
 
 // Config is config for bank test
@@ -30,6 +92,8 @@ type Config struct {
 	TableNum      int           `toml:"table_num"`
 	Concurrency   int           `toml:"concurrency"`
 	EnableLongTxn bool          `toml:"enable_long_txn"`
+	UseLongConn   bool          `toml:"use_long_conn"` // If true, each goroutine maintains its own connection
+	RetryLimit    int           `toml:"retry_limit"`   // Retry count for operations
 }
 
 // NewBankCase returns the BankCase.
@@ -40,6 +104,15 @@ func NewBankCase(cfg *Config) *BankCase {
 	if b.cfg.TableNum <= 1 {
 		b.cfg.TableNum = 1
 	}
+	// Pre-generate index strings to avoid repeated fmt.Sprintf
+	b.indexCache = make([]string, b.cfg.TableNum)
+	for i := 0; i < b.cfg.TableNum; i++ {
+		if i > 0 {
+			b.indexCache[i] = strconv.Itoa(i)
+		} else {
+			b.indexCache[i] = ""
+		}
+	}
 	return b
 }
 
@@ -49,13 +122,28 @@ func (c *BankCase) Initialize(ctx context.Context, db *sql.DB) error {
 	defer func() {
 		log.Infof("[%s] init end...", c)
 	}()
+
+	var dbConn dbConn
+	if c.cfg.UseLongConn {
+		// In long connection mode, use a dedicated connection for initialization
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		defer conn.Close()
+		dbConn = newConnWrapper(conn, ctx)
+	} else {
+		// In short connection mode, use shared connection pool
+		dbConn = &dbWrapper{db: db}
+	}
+
 	for i := 0; i < c.cfg.TableNum; i++ {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
-		err := c.initDB(ctx, db, i)
+		err := c.initDB(ctx, dbConn, db, i)
 		if err != nil {
 			return err
 		}
@@ -63,19 +151,17 @@ func (c *BankCase) Initialize(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func (c *BankCase) initDB(ctx context.Context, db *sql.DB, id int) error {
-	var index string
-	if id > 0 {
-		index = fmt.Sprintf("%d", id)
-	}
-	isDropped := c.tryDrop(db, index)
+func (c *BankCase) initDB(ctx context.Context, initConn dbConn, db *sql.DB, id int) error {
+	// Use cached index string
+	index := c.indexCache[id]
+	isDropped := c.tryDrop(initConn, index)
 	if !isDropped {
 		c.startVerify(ctx, db, index)
 		return nil
 	}
 
-	MustExec(db, fmt.Sprintf("create table if not exists accounts%s (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, remark VARCHAR(128))", index))
-	MustExec(db, `create table if not exists record (id BIGINT AUTO_INCREMENT,
+	MustExecWithConn(initConn, fmt.Sprintf("create table if not exists accounts%s (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, remark VARCHAR(128))", index))
+	MustExecWithConn(initConn, `create table if not exists record (id BIGINT AUTO_INCREMENT,
         from_id BIGINT NOT NULL,
         to_id BIGINT NOT NULL,
         from_balance BIGINT NOT NULL,
@@ -96,7 +182,28 @@ func (c *BankCase) initDB(ctx context.Context, db *sql.DB, id int) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			args := make([]string, batchSize)
+
+			// In long connection mode, each goroutine gets its own connection
+			var workerConn dbConn
+			if c.cfg.UseLongConn {
+				conn, err := db.Conn(ctx)
+				if err != nil {
+					log.Fatalf("[%s] failed to get connection: %v", c, err)
+					return
+				}
+				defer conn.Close()
+				workerConn = newConnWrapper(conn, ctx)
+			} else {
+				// In short connection mode, use shared connection
+				workerConn = initConn
+			}
+
+			// Use local random source to avoid lock contention on global rand
+			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			var queryBuilder strings.Builder
+			// Pre-allocate capacity to reduce allocations
+			queryBuilder.Grow(batchSize * 50) // Estimate: ~50 chars per value
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -108,32 +215,55 @@ func (c *BankCase) initDB(ctx context.Context, db *sql.DB, id int) error {
 					break
 				}
 				start := time.Now()
-				for i := 0; i < batchSize; i++ {
-					args[i] = fmt.Sprintf("(%d, %d, \"%s\")", startIndex+i, 1000, remark[:rand.Intn(maxLen)])
-				}
 
-				query := fmt.Sprintf("INSERT IGNORE INTO accounts%s (id, balance, remark) VALUES %s", index, strings.Join(args, ","))
+				// Build query efficiently using strings.Builder
+				queryBuilder.Reset()
+				queryBuilder.WriteString("INSERT IGNORE INTO accounts")
+				queryBuilder.WriteString(index)
+				queryBuilder.WriteString(" (id, balance, remark) VALUES ")
+
+				for i := 0; i < batchSize; i++ {
+					if i > 0 {
+						queryBuilder.WriteByte(',')
+					}
+					queryBuilder.WriteByte('(')
+					queryBuilder.WriteString(strconv.Itoa(startIndex + i))
+					queryBuilder.WriteString(", 1000, \"")
+					remarkLen := rng.Intn(maxLen)
+					if remarkLen > 0 {
+						queryBuilder.WriteString(remark[:remarkLen])
+					}
+					queryBuilder.WriteString("\")")
+				}
+				query := queryBuilder.String()
 				insertF := func() error {
-					_, err := db.Exec(query)
+					_, err := workerConn.Exec(query)
 					if IsErrDupEntry(err) {
 						return nil
 					}
 					return err
 				}
-				err := RunWithRetry(ctx, *retryLimit, 5*time.Second, insertF)
+				err := RunWithRetry(ctx, c.cfg.RetryLimit, 5*time.Second, insertF)
 				if err != nil {
 					log.Fatalf("[%s]exec %s  err %s", c, query, err)
 				}
-				log.Infof("[%s] insert %d accounts%s, takes %s", c, batchSize, index, time.Now().Sub(start))
+				log.Infof("[%s] insert %d accounts%s, takes %s", c, batchSize, index, time.Since(start))
 			}
 		}()
 	}
 
-	for i := 0; i < jobCount; i++ {
-		ch <- i * batchSize
-	}
+	// Send jobs to channel, but respect context cancellation
+	go func() {
+		defer close(ch)
+		for i := 0; i < jobCount; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- i * batchSize:
+			}
+		}
+	}()
 
-	close(ch)
 	wg.Wait()
 
 	select {
@@ -164,14 +294,17 @@ func (c *BankCase) startVerify(ctx context.Context, db *sql.DB, index string) {
 	}
 
 	start := time.Now()
+	// Start verify goroutine - it will exit when context is cancelled
 	go run(func() {
 		err := c.verify(ctx, db, index, noDelay)
 		if err != nil {
 			log.Infof("[%s] verify error: %s in: %s", c, err, time.Now())
-			if time.Now().Sub(start) > defaultVerifyTimeout {
+			if time.Since(start) > defaultVerifyTimeout {
 				atomic.StoreInt32(&c.stopped, 1)
 				log.Infof("[%s] stop bank execute", c)
-				c.wg.Wait()
+				// Note: We cannot call c.wg.Wait() here as it may cause deadlock
+				// The Execute method's goroutines are still running and may be waiting
+				// for stopped flag. Instead, we just set the flag and let Execute handle cleanup.
 				log.Fatalf("[%s] verify timeout since %s, error: %s", c, start, err)
 			}
 		} else {
@@ -193,10 +326,26 @@ func (c *BankCase) Execute(ctx context.Context, db *sql.DB) error {
 	}()
 	var wg sync.WaitGroup
 
-	run := func(f func()) {
+	run := func(f func(dbConn dbConn)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
+			// In long connection mode, each goroutine gets its own connection
+			var dbConn dbConn
+			if c.cfg.UseLongConn {
+				conn, err := db.Conn(ctx)
+				if err != nil {
+					log.Fatalf("[%s] failed to get connection: %v", c, err)
+					return
+				}
+				defer conn.Close()
+				dbConn = newConnWrapper(conn, ctx)
+			} else {
+				// In short connection mode, use shared connection pool
+				dbConn = &dbWrapper{db: db}
+			}
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -209,18 +358,21 @@ func (c *BankCase) Execute(ctx context.Context, db *sql.DB) error {
 					return
 				}
 				c.wg.Add(1)
-				f()
-				c.wg.Done()
+				// Use defer to ensure Done is called even if f panics
+				func() {
+					defer c.wg.Done()
+					f(dbConn)
+				}()
 			}
 		}()
 	}
 
 	for i := 0; i < c.cfg.Concurrency; i++ {
-		run(func() { c.moveMoney(ctx, db, noDelay) })
+		run(func(dbConn dbConn) { c.moveMoneyWithConn(ctx, dbConn, noDelay) })
 	}
 	if c.cfg.EnableLongTxn {
-		run(func() { c.moveMoney(ctx, db, delayRead) })
-		run(func() { c.moveMoney(ctx, db, delayCommit) })
+		run(func(dbConn dbConn) { c.moveMoneyWithConn(ctx, dbConn, delayRead) })
+		run(func(dbConn dbConn) { c.moveMoneyWithConn(ctx, dbConn, delayCommit) })
 	}
 
 	wg.Wait()
@@ -232,15 +384,15 @@ func (c *BankCase) String() string {
 	return "bank"
 }
 
-//tryDrop will drop table if data incorrect and panic error likes Bad connect.
-func (c *BankCase) tryDrop(db *sql.DB, index string) bool {
+// tryDrop will drop table if data incorrect and panic error likes Bad connect.
+func (c *BankCase) tryDrop(dbConn dbConn, index string) bool {
 	var (
 		count int
 		table string
 	)
 	//if table is not exist ,return true directly
 	query := fmt.Sprintf("show tables like 'accounts%s'", index)
-	err := db.QueryRow(query).Scan(&table)
+	err := dbConn.QueryRow(query).Scan(&table)
 	switch {
 	case err == sql.ErrNoRows:
 		return true
@@ -249,7 +401,7 @@ func (c *BankCase) tryDrop(db *sql.DB, index string) bool {
 	}
 
 	query = fmt.Sprintf("select count(*) as count from accounts%s", index)
-	err = db.QueryRow(query).Scan(&count)
+	err = dbConn.QueryRow(query).Scan(&count)
 	if err != nil {
 		log.Fatalf("[%s] execute query %s error %v", c, query, err)
 	}
@@ -258,15 +410,32 @@ func (c *BankCase) tryDrop(db *sql.DB, index string) bool {
 	}
 
 	log.Infof("[%s] we need %d accounts%s but got %d, re-initialize the data again", c, c.cfg.NumAccounts, index, count)
-	MustExec(db, fmt.Sprintf("drop table if exists accounts%s", index))
-	MustExec(db, "DROP TABLE IF EXISTS record")
+	MustExecWithConn(dbConn, fmt.Sprintf("drop table if exists accounts%s", index))
+	MustExecWithConn(dbConn, "DROP TABLE IF EXISTS record")
 	return true
 }
 
 func (c *BankCase) verify(ctx context.Context, db *sql.DB, index string, delay delayMode) error {
+	// Get connection based on mode
+	var dbConn dbConn
+	if c.cfg.UseLongConn {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		defer conn.Close()
+		dbConn = newConnWrapper(conn, ctx)
+	} else {
+		dbConn = &dbWrapper{db: db}
+	}
+
+	return c.verifyWithConn(ctx, dbConn, index, delay)
+}
+
+func (c *BankCase) verifyWithConn(ctx context.Context, dbConn dbConn, index string, delay delayMode) error {
 	var total int
 
-	tx, err := db.Begin()
+	tx, err := dbConn.Begin()
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -298,40 +467,43 @@ func (c *BankCase) verify(ctx context.Context, db *sql.DB, index string, delay d
 	if total != check {
 		log.Errorf("[%s] accouts%s total must %d, but got %d", c, index, check, total)
 		atomic.StoreInt32(&c.stopped, 1)
-		c.wg.Wait()
+		// Note: We cannot call c.wg.Wait() here as it may cause deadlock
+		// The Execute method's goroutines are still running and may be waiting
+		// for stopped flag. Instead, we just set the flag and let Execute handle cleanup.
 		log.Fatalf("[%s] accouts%s total must %d, but got %d", c, index, check, total)
 	}
 
 	return nil
 }
 
-func (c *BankCase) moveMoney(ctx context.Context, db *sql.DB, delay delayMode) {
+func (c *BankCase) moveMoneyWithConn(ctx context.Context, dbConn dbConn, delay delayMode) {
+	// Use local random source to avoid lock contention on global rand
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	var (
 		from, to, id int
-		index        string
 	)
 	for {
-		from, to, id = rand.Intn(c.cfg.NumAccounts), rand.Intn(c.cfg.NumAccounts), rand.Intn(c.cfg.TableNum)
+		from, to, id = rng.Intn(c.cfg.NumAccounts), rng.Intn(c.cfg.NumAccounts), rng.Intn(c.cfg.TableNum)
 		if from == to {
 			continue
 		}
 		break
 	}
-	if id > 0 {
-		index = fmt.Sprintf("%d", id)
-	}
+	// Use cached index string
+	index := c.indexCache[id]
 
-	amount := rand.Intn(999)
+	amount := rng.Intn(999)
 
-	err := c.execTransaction(ctx, db, from, to, amount, index, delay)
+	err := c.execTransaction(ctx, dbConn, from, to, amount, index, delay)
 
 	if err != nil {
 		return
 	}
 }
 
-func (c *BankCase) execTransaction(ctx context.Context, db *sql.DB, from, to int, amount int, index string, delay delayMode) error {
-	tx, err := db.Begin()
+func (c *BankCase) execTransaction(ctx context.Context, dbConn dbConn, from, to int, amount int, index string, delay delayMode) error {
+	tx, err := dbConn.Begin()
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -345,7 +517,17 @@ func (c *BankCase) execTransaction(ctx context.Context, db *sql.DB, from, to int
 		}
 	}
 
-	rows, err := tx.Query(fmt.Sprintf("SELECT id, balance FROM accounts%s WHERE id IN (%d, %d) FOR UPDATE", index, from, to))
+	// Build query using strings.Builder for better performance
+	var queryBuilder strings.Builder
+	queryBuilder.Grow(100)
+	queryBuilder.WriteString("SELECT id, balance FROM accounts")
+	queryBuilder.WriteString(index)
+	queryBuilder.WriteString(" WHERE id IN (")
+	queryBuilder.WriteString(strconv.Itoa(from))
+	queryBuilder.WriteString(", ")
+	queryBuilder.WriteString(strconv.Itoa(to))
+	queryBuilder.WriteString(") FOR UPDATE")
+	rows, err := tx.Query(queryBuilder.String())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -384,11 +566,25 @@ func (c *BankCase) execTransaction(ctx context.Context, db *sql.DB, from, to int
 
 	var update string
 	if fromBalance >= amount {
-		update = fmt.Sprintf(`
-UPDATE accounts%s
-  SET balance = CASE id WHEN %d THEN %d WHEN %d THEN %d END
-  WHERE id IN (%d, %d)
-`, index, to, toBalance+amount, from, fromBalance-amount, from, to)
+		// Build UPDATE query using strings.Builder for better performance
+		var updateBuilder strings.Builder
+		updateBuilder.Grow(200)
+		updateBuilder.WriteString("UPDATE accounts")
+		updateBuilder.WriteString(index)
+		updateBuilder.WriteString(" SET balance = CASE id WHEN ")
+		updateBuilder.WriteString(strconv.Itoa(to))
+		updateBuilder.WriteString(" THEN ")
+		updateBuilder.WriteString(strconv.Itoa(toBalance + amount))
+		updateBuilder.WriteString(" WHEN ")
+		updateBuilder.WriteString(strconv.Itoa(from))
+		updateBuilder.WriteString(" THEN ")
+		updateBuilder.WriteString(strconv.Itoa(fromBalance - amount))
+		updateBuilder.WriteString(" END WHERE id IN (")
+		updateBuilder.WriteString(strconv.Itoa(from))
+		updateBuilder.WriteString(", ")
+		updateBuilder.WriteString(strconv.Itoa(to))
+		updateBuilder.WriteString(")")
+		update = updateBuilder.String()
 		_, err = tx.Exec(update)
 		if err != nil {
 			return errors.Trace(err)
@@ -402,9 +598,23 @@ UPDATE accounts%s
 		} else {
 			tso = uint64(time.Now().UnixNano())
 		}
-		if _, err = tx.Exec(fmt.Sprintf(`
-INSERT INTO record (from_id, to_id, from_balance, to_balance, amount, tso)
-    VALUES (%d, %d, %d, %d, %d, %d)`, from, to, fromBalance, toBalance, amount, tso)); err != nil {
+		// Build INSERT query using strings.Builder for better performance
+		var insertBuilder strings.Builder
+		insertBuilder.Grow(150)
+		insertBuilder.WriteString("INSERT INTO record (from_id, to_id, from_balance, to_balance, amount, tso) VALUES (")
+		insertBuilder.WriteString(strconv.Itoa(from))
+		insertBuilder.WriteString(", ")
+		insertBuilder.WriteString(strconv.Itoa(to))
+		insertBuilder.WriteString(", ")
+		insertBuilder.WriteString(strconv.Itoa(fromBalance))
+		insertBuilder.WriteString(", ")
+		insertBuilder.WriteString(strconv.Itoa(toBalance))
+		insertBuilder.WriteString(", ")
+		insertBuilder.WriteString(strconv.Itoa(amount))
+		insertBuilder.WriteString(", ")
+		insertBuilder.WriteString(strconv.FormatUint(tso, 10))
+		insertBuilder.WriteString(")")
+		if _, err = tx.Exec(insertBuilder.String()); err != nil {
 			return err
 		}
 		log.Infof("[%s] exec pre: %s", c, update)
@@ -433,7 +643,9 @@ func (c *BankCase) delay(ctx context.Context) error {
 	start := time.Now()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	delayDuration := minDelayDuration + time.Duration(rand.Int63n(int64(maxDelayDuration-minDelayDuration)))
+	// Use local random source to avoid lock contention
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	delayDuration := minDelayDuration + time.Duration(rng.Int63n(int64(maxDelayDuration-minDelayDuration)))
 	for {
 		select {
 		case <-ctx.Done():
