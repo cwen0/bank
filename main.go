@@ -15,18 +15,19 @@ import (
 var defaultPushMetricsInterval = 15 * time.Second
 
 var (
-	dbName      = flag.String("db", "test", "database name")
-	pw          = flag.String("pw", "", "database password")
-	user        = flag.String("user", "root", "database user")
-	accounts    = flag.Int("accounts", 1000000, "the number of accounts")
-	interval    = flag.Duration("interval", 2*time.Second, "the interval")
-	tables      = flag.Int("tables", 1, "the number of the tables")
-	concurrency = flag.Int("concurrency", 200, "concurrency worker count")
-	retryLimit  = flag.Int("retry-limit", 200, "retry count")
-	longTxn     = flag.Bool("long-txn", true, "enable long-term transactions")
-	pessimistic = flag.Bool("pessimistic", false, "use pessimistic transaction")
-	dbAddr      = flag.String("addr", "", "the address of db")
-	longConn    = flag.Bool("long-conn", false, "use long connection mode (each goroutine maintains its own connection)")
+	dbName        = flag.String("db", "test", "database name")
+	pw            = flag.String("pw", "", "database password")
+	user          = flag.String("user", "root", "database user")
+	accounts      = flag.Int("accounts", 1000000, "the number of accounts")
+	interval      = flag.Duration("interval", 2*time.Second, "the interval")
+	tables        = flag.Int("tables", 1, "the number of the tables")
+	concurrency   = flag.Int("concurrency", 200, "concurrency worker count")
+	retryLimit    = flag.Int("retry-limit", 200, "retry count")
+	longTxn       = flag.Bool("long-txn", true, "enable long-term transactions")
+	pessimistic   = flag.Bool("pessimistic", false, "use pessimistic transaction")
+	dbAddr        = flag.String("addr", "", "the address of db")
+	longConn      = flag.Bool("long-conn", false, "use long connection mode (each goroutine maintains its own connection)")
+	shortConnOnce = flag.Bool("short-conn-once", false, "use one-shot short connection mode (open and close each operation)")
 )
 
 var (
@@ -40,11 +41,15 @@ var (
 func main() {
 	flag.Parse()
 
+	if *longConn && *shortConnOnce {
+		log.Fatal("cannot enable both -long-conn and -short-conn-once")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dbDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s", *user, *pw, *dbAddr, *dbName)
 	log.Info(dbDSN)
-	db, err := OpenDB(dbDSN, 1, *longConn)
+	db, err := OpenDB(dbDSN, 1, *longConn, *shortConnOnce)
 	if err != nil {
 		log.Fatalf("[bank] create dlog error %v", err)
 	}
@@ -75,7 +80,7 @@ func main() {
 
 	time.Sleep(5 * time.Second)
 
-	db, err = OpenDB(dbDSN, *concurrency, *longConn)
+	db, err = OpenDB(dbDSN, *concurrency, *longConn, *shortConnOnce)
 	if err != nil {
 		log.Fatalf("[bank] create dlog error %v", err)
 	}
@@ -99,13 +104,14 @@ func main() {
 	}()
 
 	cfg := Config{
-		NumAccounts:   *accounts,
-		Interval:      *interval,
-		TableNum:      *tables,
-		Concurrency:   *concurrency,
-		EnableLongTxn: *longTxn,
-		UseLongConn:   *longConn,
-		RetryLimit:    *retryLimit,
+		NumAccounts:      *accounts,
+		Interval:         *interval,
+		TableNum:         *tables,
+		Concurrency:      *concurrency,
+		EnableLongTxn:    *longTxn,
+		UseLongConn:      *longConn,
+		UseShortConnOnce: *shortConnOnce,
+		RetryLimit:       *retryLimit,
 	}
 	bank := NewBankCase(&cfg)
 	if err := bank.Initialize(ctx, db); err != nil {

@@ -57,6 +57,8 @@ Usage of ./bin/bank:
         the interval (default 2s)
   -long-conn
         use long connection mode (each goroutine maintains its own connection)
+  -short-conn-once
+        use one-shot short connection mode (open and close each operation)
   -long-txn
         enable long-term transactions (default true)
   -pessimistic
@@ -73,9 +75,11 @@ Usage of ./bin/bank:
 
 ### Connection Modes
 
-The tool supports two connection modes:
+The tool supports three connection modes:
 
 - **Short Connection Mode (default)**: Uses a connection pool where connections are shared among goroutines. Connections expire after 5 minutes to ensure freshness. This mode is suitable for most scenarios and provides better resource utilization.
+
+- **One-shot Short Connection Mode (`-short-conn-once`)**: Opens a new connection for each operation/transaction and closes it immediately after use. This simulates typical request-scoped short connections where no connection reuse is allowed. This mode is mutually exclusive with `-long-conn`.
 
 - **Long Connection Mode (`-long-conn`)**: Each goroutine maintains its own dedicated database connection throughout its lifetime. Connections are kept alive for up to 1 hour. This mode is useful for:
   - Testing connection-related features
@@ -94,6 +98,12 @@ Using long connection mode:
 
 ```bash
 ./bin/bank -addr 127.0.0.1:4000 -db test -user root -long-conn
+```
+
+Using one-shot short connection mode:
+
+```bash
+./bin/bank -addr 127.0.0.1:4000 -db test -user root -short-conn-once
 ```
 
 With custom concurrency and accounts:

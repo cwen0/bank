@@ -87,13 +87,14 @@ type BankCase struct {
 // Config is config for bank test
 type Config struct {
 	// NumAccounts is total accounts
-	NumAccounts   int           `toml:"num_accounts"`
-	Interval      time.Duration `toml:"interval"`
-	TableNum      int           `toml:"table_num"`
-	Concurrency   int           `toml:"concurrency"`
-	EnableLongTxn bool          `toml:"enable_long_txn"`
-	UseLongConn   bool          `toml:"use_long_conn"` // If true, each goroutine maintains its own connection
-	RetryLimit    int           `toml:"retry_limit"`   // Retry count for operations
+	NumAccounts      int           `toml:"num_accounts"`
+	Interval         time.Duration `toml:"interval"`
+	TableNum         int           `toml:"table_num"`
+	Concurrency      int           `toml:"concurrency"`
+	EnableLongTxn    bool          `toml:"enable_long_txn"`
+	UseLongConn      bool          `toml:"use_long_conn"`       // If true, each goroutine maintains its own connection
+	UseShortConnOnce bool          `toml:"use_short_conn_once"` // If true, open and close per operation
+	RetryLimit       int           `toml:"retry_limit"`         // Retry count for operations
 }
 
 // NewBankCase returns the BankCase.
@@ -124,7 +125,10 @@ func (c *BankCase) Initialize(ctx context.Context, db *sql.DB) error {
 	}()
 
 	var dbConn dbConn
-	if c.cfg.UseLongConn {
+	if c.cfg.UseShortConnOnce {
+		// One-shot mode: initDB will open/close per operation
+		dbConn = nil
+	} else if c.cfg.UseLongConn {
 		// In long connection mode, use a dedicated connection for initialization
 		conn, err := db.Conn(ctx)
 		if err != nil {
@@ -133,7 +137,7 @@ func (c *BankCase) Initialize(ctx context.Context, db *sql.DB) error {
 		defer conn.Close()
 		dbConn = newConnWrapper(conn, ctx)
 	} else {
-		// In short connection mode, use shared connection pool
+		// In short connection pool mode, use shared connection pool
 		dbConn = &dbWrapper{db: db}
 	}
 
@@ -154,14 +158,33 @@ func (c *BankCase) Initialize(ctx context.Context, db *sql.DB) error {
 func (c *BankCase) initDB(ctx context.Context, initConn dbConn, db *sql.DB, id int) error {
 	// Use cached index string
 	index := c.indexCache[id]
-	isDropped := c.tryDrop(initConn, index)
+
+	var baseConn dbConn
+	var cleanup func()
+	if c.cfg.UseShortConnOnce {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		baseConn = newConnWrapper(conn, ctx)
+		cleanup = func() { conn.Close() }
+	} else {
+		baseConn = initConn
+		cleanup = func() {}
+	}
+	if baseConn == nil {
+		return errors.New("init connection is nil")
+	}
+	defer cleanup()
+
+	isDropped := c.tryDrop(baseConn, index)
 	if !isDropped {
 		c.startVerify(ctx, db, index)
 		return nil
 	}
 
-	MustExecWithConn(initConn, fmt.Sprintf("create table if not exists accounts%s (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, remark VARCHAR(128))", index))
-	MustExecWithConn(initConn, `create table if not exists record (id BIGINT AUTO_INCREMENT,
+	MustExecWithConn(baseConn, fmt.Sprintf("create table if not exists accounts%s (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, remark VARCHAR(128))", index))
+	MustExecWithConn(baseConn, `create table if not exists record (id BIGINT AUTO_INCREMENT,
         from_id BIGINT NOT NULL,
         to_id BIGINT NOT NULL,
         from_balance BIGINT NOT NULL,
@@ -193,9 +216,9 @@ func (c *BankCase) initDB(ctx context.Context, initConn dbConn, db *sql.DB, id i
 				}
 				defer conn.Close()
 				workerConn = newConnWrapper(conn, ctx)
-			} else {
-				// In short connection mode, use shared connection
-				workerConn = initConn
+			} else if !c.cfg.UseShortConnOnce {
+				// In short connection pool mode, use shared connection
+				workerConn = baseConn
 			}
 
 			// Use local random source to avoid lock contention on global rand
@@ -237,6 +260,14 @@ func (c *BankCase) initDB(ctx context.Context, initConn dbConn, db *sql.DB, id i
 				}
 				query := queryBuilder.String()
 				insertF := func() error {
+					if c.cfg.UseShortConnOnce {
+						conn, err := db.Conn(ctx)
+						if err != nil {
+							return err
+						}
+						workerConn = newConnWrapper(conn, ctx)
+						defer conn.Close()
+					}
 					_, err := workerConn.Exec(query)
 					if IsErrDupEntry(err) {
 						return nil
@@ -341,8 +372,8 @@ func (c *BankCase) Execute(ctx context.Context, db *sql.DB) error {
 				}
 				defer conn.Close()
 				dbConn = newConnWrapper(conn, ctx)
-			} else {
-				// In short connection mode, use shared connection pool
+			} else if !c.cfg.UseShortConnOnce {
+				// In short connection pool mode, use shared connection pool
 				dbConn = &dbWrapper{db: db}
 			}
 
@@ -361,6 +392,16 @@ func (c *BankCase) Execute(ctx context.Context, db *sql.DB) error {
 				// Use defer to ensure Done is called even if f panics
 				func() {
 					defer c.wg.Done()
+					if c.cfg.UseShortConnOnce {
+						conn, err := db.Conn(ctx)
+						if err != nil {
+							log.Fatalf("[%s] failed to get connection: %v", c, err)
+							return
+						}
+						defer conn.Close()
+						f(newConnWrapper(conn, ctx))
+						return
+					}
 					f(dbConn)
 				}()
 			}
@@ -418,7 +459,7 @@ func (c *BankCase) tryDrop(dbConn dbConn, index string) bool {
 func (c *BankCase) verify(ctx context.Context, db *sql.DB, index string, delay delayMode) error {
 	// Get connection based on mode
 	var dbConn dbConn
-	if c.cfg.UseLongConn {
+	if c.cfg.UseLongConn || c.cfg.UseShortConnOnce {
 		conn, err := db.Conn(ctx)
 		if err != nil {
 			return errors.Trace(err)

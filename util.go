@@ -15,10 +15,13 @@ import (
 // - Sets longer connection lifetime (1 hour)
 // - Sets larger max open connections
 // - Sets larger max idle connections
-// If useLongConn is false (short connection mode):
+// If useShortConnOnce is true, it configures the pool to avoid idle reuse:
+// - Sets max idle connections to 0 so conns close on release
+// - Uses per-operation connections (caller closes *sql.Conn after use)
+// Otherwise (short connection pool mode):
 // - Sets shorter connection lifetime (5 minutes)
 // - Uses connection pool with limited connections
-func OpenDB(dsn string, maxIdleConns int, useLongConn bool) (*sql.DB, error) {
+func OpenDB(dsn string, maxIdleConns int, useLongConn bool, useShortConnOnce bool) (*sql.DB, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
@@ -30,6 +33,12 @@ func OpenDB(dsn string, maxIdleConns int, useLongConn bool) (*sql.DB, error) {
 		db.SetMaxIdleConns(maxIdleConns)
 		db.SetConnMaxLifetime(1 * time.Hour) // Keep connections for 1 hour
 		log.Info("DB opens successfully with long connection mode")
+	} else if useShortConnOnce {
+		// One-shot short connection mode: close conns on release
+		db.SetMaxOpenConns(maxIdleConns)
+		db.SetMaxIdleConns(0)
+		db.SetConnMaxLifetime(0)
+		log.Info("DB opens successfully with one-shot short connection mode")
 	} else {
 		// Short connection mode: connections expire quickly
 		db.SetMaxOpenConns(maxIdleConns)
